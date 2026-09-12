@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import struct
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from enum import IntEnum
@@ -23,6 +24,8 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Self
 
 from .commands import Command, CommandFailedError, SecurityCommandResponse
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .events import SystemEvent
@@ -141,7 +144,37 @@ class OmniClient:
 
     async def __aenter__(self) -> Self:
         await self._conn.connect()
+        await self._enable_notifications()
         return self
+
+    async def _enable_notifications(self) -> None:
+        """Ask the panel to start pushing unsolicited SystemEvents.
+
+        Opcode 21 (EnableNotifications) is defined on the wire but, prior
+        to this fix, was never actually sent — meaning ``events()`` /
+        ``subscribe()`` would sit listening on ``unsolicited()`` forever
+        without the panel ever having been told to start broadcasting.
+        Best-effort: some firmware/transport combinations (or panels with
+        this already implicitly on) may NAK or not implement the opcode
+        at all — that's not fatal, it just means callers relying solely
+        on push should also poll, same as before this patch.
+        """
+        try:
+            reply = await self._conn.request(OmniLink2MessageType.EnableNotifications)
+        except Exception:
+            _LOGGER.debug(
+                "EnableNotifications request failed; falling back to poll-only",
+                exc_info=True,
+            )
+            return
+        if reply.opcode == int(OmniLink2MessageType.Ack):
+            _LOGGER.info("panel ACKed EnableNotifications — push events enabled")
+        else:
+            _LOGGER.debug(
+                "EnableNotifications got opcode %d (expected Ack=%d) — "
+                "push events may not be active",
+                reply.opcode, int(OmniLink2MessageType.Ack),
+            )
 
     async def __aexit__(
         self,
