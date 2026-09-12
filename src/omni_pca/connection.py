@@ -670,6 +670,10 @@ class OmniConnection:
                 except (ProtocolError, ConnectionError) as exc:
                     _log.warning("dropping malformed unsolicited packet: %s", exc)
                     return
+                _log.info(
+                    "unsolicited packet: inner opcode=%d payload=%r",
+                    msg.opcode, msg.payload,
+                )
                 try:
                     self._unsolicited_queue.put_nowait(msg)
                 except asyncio.QueueFull:  # pragma: no cover - unbounded queue
@@ -732,4 +736,3 @@ class _OmniDatagramProtocol(asyncio.DatagramProtocol):
     def connection_lost(self, exc: Exception | None) -> None:
         if exc is not None:
             _log.warning("UDP transport lost: %s", exc)
-
