@@ -8,6 +8,6 @@
     "integration_type": "hub",
     "iot_class": "local_push",
     "issue_tracker": "https://github.com/rsp2k/omni-pca/issues",
-    "requirements": ["omni-pca==2026.5.16"],
+    "requirements": ["omni-pca @ git+https://github.com/rfscholl03048/omni-pca.git@main"]
     "version": "2026.5.16"
 }
