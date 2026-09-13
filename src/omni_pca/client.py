@@ -796,6 +796,50 @@ class OmniClient:
             out.append(parser.parse(chunk))
         return out
 
+    def status_pushes(self) -> AsyncIterator[StatusReply]:
+        """Async iterator over unsolicited ExtendedStatus push messages.
+
+        The panel's real push mechanism (discovered against a live
+        OmniPro II — see docs/JOURNEY.md) is *not* a distinct SystemEvents
+        (opcode 55) message as :class:`EventStream`/:meth:`events`
+        assumes. Instead, whenever a Zone, Unit, or other status-bearing
+        object's state changes, the panel spontaneously re-sends a single-
+        record ExtendedStatus message (opcode 59) — wire-identical to a
+        polled reply, just delivered unprompted with the outer packet's
+        seq stubbed to 0. This has been observed firing for Zones, Units
+        (including "Extended"/UPB-addressed Units with no real UPB bus —
+        the panel apparently tracks and broadcasts their commanded state
+        regardless of whether the underlying protocol transaction is
+        real), and Aux Sensors.
+
+        This iterator reuses the exact same per-record parser table
+        (``OBJECT_TYPE_TO_STATUS``) that :meth:`get_extended_status` uses
+        for polled replies, so callers get the same typed
+        ``ZoneStatus``/``UnitStatus``/etc. objects either way — merging
+        a pushed record into cached state is a drop-in replacement for
+        merging a polled one.
+        """
+
+        async def _gen() -> AsyncIterator[StatusReply]:
+            async for msg in self._conn.unsolicited():
+                if msg.opcode != int(OmniLink2MessageType.ExtendedStatus):
+                    continue
+                body = msg.payload
+                if len(body) < 2:
+                    continue
+                parser = OBJECT_TYPE_TO_STATUS.get(body[0])
+                record_size = body[1]
+                if parser is None or record_size == 0:
+                    continue
+                records_buf = body[2:]
+                for off in range(0, len(records_buf), record_size):
+                    chunk = records_buf[off : off + record_size]
+                    if len(chunk) < record_size:
+                        break
+                    yield parser.parse(chunk)
+
+        return _gen()
+
     async def list_zone_names(self) -> dict[int, str]:
         """Walk all zones, returning ``{index: name}`` for those with a name set."""
         return await self._walk_named_objects(
