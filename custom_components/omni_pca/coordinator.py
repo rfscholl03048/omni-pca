@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from dataclasses import dataclass, field, replace
+from typing import Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -60,10 +62,12 @@ from omni_pca.models import (
     OBJECT_TYPE_TO_PROPERTIES,
     AreaProperties,
     AreaStatus,
+    AuxSensorStatus,
     ButtonProperties,
     ObjectType,
     SystemInformation,
     SystemStatus,
+    StatusReply,
     ThermostatProperties,
     ThermostatStatus,
     UnitProperties,
@@ -81,7 +85,16 @@ from .const import (
     MANUFACTURER,
     MAX_OBJECT_INDEX,
     SCAN_INTERVAL,
+    STATUS_PUSH_TASK_NAME,
 )
+
+# If the panel has pushed at least once but then goes silent this long while
+# polling still succeeds, the push stream is presumed dead — force a
+# reconnect, which re-sends EnableNotifications. The panel's AuxSensor pushes
+# are bursty (a few at 30 s spacing, then ~270 s of silence, observed on a
+# live Omni Pro II), so this must sit well above that gap. Never armed on a
+# panel that has never pushed.
+PUSH_WATCHDOG_SECS: Final = 900
 
 # --------------------------------------------------------------------------
 # Public data shape exposed to entities
@@ -114,6 +127,7 @@ class OmniData:
     unit_status: dict[int, UnitStatus] = field(default_factory=dict)
     area_status: dict[int, AreaStatus] = field(default_factory=dict)
     thermostat_status: dict[int, ThermostatStatus] = field(default_factory=dict)
+    aux_sensor_status: dict[int, AuxSensorStatus] = field(default_factory=dict)
 
     system_status: SystemStatus | None = None
     last_event: SystemEvent | None = None
@@ -141,11 +155,18 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
         pca_path: str | None = None,
         pca_key: int = 0,
     ) -> None:
+        from datetime import timedelta
+
+        from .const import CONF_SCAN_INTERVAL
+
+        scan_seconds = entry.options.get(
+            CONF_SCAN_INTERVAL, int(SCAN_INTERVAL.total_seconds())
+        )
         super().__init__(
             hass,
             LOGGER,
             name=f"{DOMAIN} {host}:{port}",
-            update_interval=SCAN_INTERVAL,
+            update_interval=timedelta(seconds=scan_seconds),
             config_entry=entry,
         )
         self._host = host
@@ -158,6 +179,9 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
         self._discovery_done = False
         self._discovered: OmniData | None = None
         self._event_task: asyncio.Task[None] | None = None
+        self._status_push_task: asyncio.Task[None] | None = None
+        self._push_seen = False
+        self._last_push = time.monotonic()
 
     # ---- public surface --------------------------------------------------
 
@@ -189,18 +213,34 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
     async def async_shutdown(self) -> None:
         """Tear down the event task and the client connection on unload."""
         await self._cancel_event_task()
+        await self._cancel_status_push_task()
         await self._drop_client()
         await super().async_shutdown()
 
     # ---- DataUpdateCoordinator hook -------------------------------------
 
     async def _async_update_data(self) -> OmniData:
+        await self._check_push_watchdog()
         try:
             client = await self._ensure_connected()
             if not self._discovery_done:
                 self._discovered = await self._run_discovery(client)
                 self._discovery_done = True
-                self._start_event_task()
+                # NOTE: _start_event_task() (SystemEvents/opcode-55 listener)
+                # is intentionally NOT started. Against a real OmniPro II,
+                # opcode 55 never occurs — the panel's actual push mechanism
+                # is unsolicited ExtendedStatus (opcode 59), handled below.
+                # Running both listeners concurrently means they race to
+                # drain the same unsolicited() queue: whichever task's
+                # queue.get() wins a given item gets it, and the other
+                # loses it permanently — this was silently dropping roughly
+                # half of every real push (see docs/JOURNEY.md).
+
+            # Idempotent, and run EVERY cycle (not just after discovery): the
+            # listener is bound to one client, and a dropped/recreated client
+            # (e.g. panel connection reset) needs a fresh listener or pushes
+            # stop forever and we silently fall back to polling.
+            self._start_status_push_task(client)
 
             assert self._discovered is not None
             base = self._discovered
@@ -223,6 +263,17 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
         # poll path doesn't see push events so it must not overwrite it.
         last_event = self.data.last_event if self.data is not None else None
 
+        # Same problem, same fix, for aux_sensor_status: this poll cycle
+        # rebuilds from self._discovered (always an empty dict here, since
+        # discovery never populates it) rather than self.data, so without
+        # this it silently wiped out whatever the push listener had just
+        # set — producing an ~30s alternating real-value/stale-fallback
+        # flicker on every analog-zone-as-aux-sensor reading (confirmed
+        # against a live panel's outdoor temp probe).
+        aux_sensor_status = (
+            self.data.aux_sensor_status if self.data is not None else {}
+        )
+
         return replace(
             self._discovered,
             zone_status=zone_status,
@@ -231,6 +282,7 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             thermostat_status=thermostat_status,
             system_status=system_status,
             last_event=last_event,
+            aux_sensor_status=aux_sensor_status,
         )
 
     # ---- connection management ------------------------------------------
@@ -268,6 +320,9 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             return
         client = self._client
         self._client = None
+        # The push listener is parked on this client's unsolicited queue,
+        # which never signals close — it must be cancelled explicitly.
+        await self._cancel_status_push_task()
         try:
             await client.__aexit__(None, None, None)
         except Exception:  # pragma: no cover - best-effort cleanup
@@ -306,10 +361,29 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             programs=programs,
         )
 
+    # Stopgap until RequestCapacities (opcode 30/31 — defined in
+    # opcodes.py but never implemented/parsed anywhere in this library)
+    # is wired up to bound discovery by the panel's actual configured
+    # capacity: list_zone_names() walks the full protocol index space
+    # (1..MAX_OBJECT_INDEX) looking for anything with a non-empty name,
+    # and on a panel that's been reconfigured/downsized over its life
+    # (16 physically-wired zones here), leftover garbage bytes in unused
+    # EEPROM slots at much higher indices can decode to a non-empty
+    # (garbled) "name" — creating real, un-deletable HA entities for
+    # objects that don't exist in PC Access's own UI at all (its Zones
+    # table caps at the panel's real 16). Deliberately NOT applied to
+    # Units — those legitimately run much higher (Outputs commonly sit
+    # in the 300s+ on this hardware), so a blanket per-object-type cap
+    # would hide real, working objects.
+    _MAX_REALISTIC_ZONE_INDEX: Final = 64
+
     async def _discover_zones(
         self, client: OmniClient
     ) -> dict[int, ZoneProperties]:
         names = await self._best_effort(client.list_zone_names, default={})
+        names = {
+            i: n for i, n in names.items() if i <= self._MAX_REALISTIC_ZONE_INDEX
+        }
         out: dict[int, ZoneProperties] = {}
         for index in sorted(names):
             try:
@@ -576,43 +650,90 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
 
     # ---- live polling ----------------------------------------------------
 
+    # Panels with sparse object numbering (real-world Omni Pro II panels
+    # routinely have zones/units scattered across a wide index space —
+    # e.g. 39 zones living somewhere inside 1..214, or 17 units scattered
+    # across 1..392 because Outputs/other object types share the same
+    # numbering range) will NAK a single RequestExtendedStatus spanning
+    # the whole 1..max(index) range: most of that span is undefined
+    # slots, and real firmware rejects it outright rather than returning
+    # sparse/partial data. We instead walk only the *actually defined*
+    # indices, in small contiguous runs, so every request maps to real
+    # objects the panel knows about.
+    _STATUS_CHUNK_SIZE = 16
+
+    @staticmethod
+    def _contiguous_chunks(indices: list[int], chunk_size: int) -> list[tuple[int, int]]:
+        """Group sorted indices into (start, end) runs of consecutive ints.
+
+        A run is further split so no single request spans more than
+        ``chunk_size`` indices, since even a real, fully-defined range
+        may exceed whatever the panel's reply buffer can hold in one
+        RequestExtendedStatus/RequestStatus round trip.
+        """
+        if not indices:
+            return []
+        chunks: list[tuple[int, int]] = []
+        run_start = run_prev = indices[0]
+        for idx in indices[1:]:
+            if idx == run_prev + 1 and (idx - run_start) < chunk_size:
+                run_prev = idx
+                continue
+            chunks.append((run_start, run_prev))
+            run_start = run_prev = idx
+        chunks.append((run_start, run_prev))
+        return chunks
+
+    async def _poll_status_chunked(
+        self,
+        client: OmniClient,
+        object_type: ObjectType,
+        defined: dict[int, object],
+        status_cls: type,
+        *,
+        label: str,
+    ) -> dict[int, object]:
+        """Poll ExtendedStatus for ``defined``'s indices only, chunk by chunk.
+
+        Each chunk failure is caught independently so one bad/oversized
+        run doesn't blank out status for every other object of this
+        type; we keep whatever the previous poll had for that chunk.
+        """
+        if not defined:
+            return {}
+        previous = getattr(self.data, f"{label}_status", {}) if self.data else {}
+        out: dict[int, object] = dict(previous)
+        for start, end in self._contiguous_chunks(
+            sorted(defined), self._STATUS_CHUNK_SIZE
+        ):
+            try:
+                records = await client.get_extended_status(object_type, start, end)
+            except (OmniConnectionError, RequestTimeoutError):
+                raise
+            except Exception:
+                LOGGER.debug(
+                    "%s extended_status poll failed for range %d..%d",
+                    label, start, end, exc_info=True,
+                )
+                continue
+            for r in records:
+                if isinstance(r, status_cls) and r.index in defined:
+                    out[r.index] = r
+        return {k: v for k, v in out.items() if k in defined}
+
     async def _poll_zone_status(
         self, client: OmniClient, zones: dict[int, ZoneProperties]
     ) -> dict[int, ZoneStatus]:
-        if not zones:
-            return {}
-        end = max(zones)
-        try:
-            records = await client.get_extended_status(ObjectType.ZONE, 1, end)
-        except (OmniConnectionError, RequestTimeoutError):
-            raise
-        except Exception:
-            LOGGER.debug("zone extended_status poll failed", exc_info=True)
-            return self.data.zone_status if self.data is not None else {}
-        return {
-            r.index: r
-            for r in records
-            if isinstance(r, ZoneStatus) and r.index in zones
-        }
+        return await self._poll_status_chunked(
+            client, ObjectType.ZONE, zones, ZoneStatus, label="zone"
+        )
 
     async def _poll_unit_status(
         self, client: OmniClient, units: dict[int, UnitProperties]
     ) -> dict[int, UnitStatus]:
-        if not units:
-            return {}
-        end = max(units)
-        try:
-            records = await client.get_extended_status(ObjectType.UNIT, 1, end)
-        except (OmniConnectionError, RequestTimeoutError):
-            raise
-        except Exception:
-            LOGGER.debug("unit extended_status poll failed", exc_info=True)
-            return self.data.unit_status if self.data is not None else {}
-        return {
-            r.index: r
-            for r in records
-            if isinstance(r, UnitStatus) and r.index in units
-        }
+        return await self._poll_status_chunked(
+            client, ObjectType.UNIT, units, UnitStatus, label="unit"
+        )
 
     async def _poll_area_status(
         self, client: OmniClient, areas: dict[int, AreaProperties]
@@ -688,6 +809,114 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
+    # ---- status-push listener ---------------------------------------------
+    #
+    # Discovered against a live OmniPro II (see docs/JOURNEY.md): the
+    # panel's actual push mechanism is *not* SystemEvents (opcode 55,
+    # what _run_event_listener/EventStream above assumes) — it's an
+    # unsolicited, single-record ExtendedStatus message (opcode 59),
+    # wire-identical to a polled reply. This fires for Zones, Units
+    # (including "Extended"/UPB-addressed ones with no real UPB bus —
+    # the panel tracks and broadcasts their commanded state regardless),
+    # and Aux Sensors. Running this as a second, independent listener
+    # task means live state reaches entities immediately rather than
+    # waiting for the next SCAN_INTERVAL poll.
+
+    def _start_status_push_task(self, client: OmniClient) -> None:
+        if self._status_push_task is not None and not self._status_push_task.done():
+            return
+        self._last_push = time.monotonic()
+        self._status_push_task = self.config_entry.async_create_background_task(
+            self.hass,
+            self._run_status_push_listener(client),
+            STATUS_PUSH_TASK_NAME,
+        )
+
+    async def _check_push_watchdog(self) -> None:
+        """Reconnect if pushes were flowing but have gone silent."""
+        if self._client is None or not self._push_seen:
+            return
+        silent = time.monotonic() - self._last_push
+        if silent > PUSH_WATCHDOG_SECS:
+            LOGGER.warning(
+                "no status push from panel for %.0f s while polling succeeds; "
+                "reconnecting to re-arm push notifications",
+                silent,
+            )
+            self._last_push = time.monotonic()  # no reconnect storm
+            await self._drop_client()
+
+    async def _cancel_status_push_task(self) -> None:
+        if self._status_push_task is None:
+            return
+        task = self._status_push_task
+        self._status_push_task = None
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def _run_status_push_listener(self, client: OmniClient) -> None:
+        """Background loop: consume pushed ExtendedStatus records live.
+
+        Bound to the ``client`` it was started for; ``_drop_client`` cancels
+        it, and ``_async_update_data`` starts a fresh one for the new client.
+        """
+        try:
+            async for record in client.status_pushes():
+                self._apply_status_push(record)
+        except asyncio.CancelledError:
+            raise
+        except (OmniConnectionError, RequestTimeoutError, OSError):
+            LOGGER.debug(
+                "status push listener exited on transport error", exc_info=True
+            )
+        except Exception:  # pragma: no cover - defensive
+            LOGGER.exception("status push listener crashed")
+
+    def _apply_status_push(self, record: StatusReply) -> None:
+        """Merge one pushed status record into ``self.data`` immediately."""
+        LOGGER.info("status push received: %r", record)
+        self._push_seen = True
+        self._last_push = time.monotonic()
+        data = self.data
+        if data is None:
+            return
+        if isinstance(record, ZoneStatus) and record.index in data.zones:
+            new_zone_status = dict(data.zone_status)
+            new_zone_status[record.index] = record
+            self.async_set_updated_data(replace(data, zone_status=new_zone_status))
+        elif isinstance(record, UnitStatus) and record.index in data.units:
+            new_unit_status = dict(data.unit_status)
+            new_unit_status[record.index] = record
+            self.async_set_updated_data(replace(data, unit_status=new_unit_status))
+        elif isinstance(record, AuxSensorStatus):
+            # raw=0 is the panel's documented "not available / unknown"
+            # sentinel (see omni_temp_to_fahrenheit's docstring in the
+            # library) and arrives interspersed between real readings —
+            # confirmed against a live panel's outdoor temp probe, which
+            # alternates a real value with this sentinel on roughly every
+            # other push. Skip merging it entirely rather than overwrite
+            # a good last-known reading with "no data this cycle" — the
+            # entity should hold its last real value through the noise,
+            # not flicker to Unknown every other update.
+            if record.value_raw == 0:
+                pass
+            else:
+                # Not gated on a discovered-objects dict the way Zone/Unit
+                # are: Aux Sensors (e.g. an "Extended Range" analog zone
+                # wired as an outdoor temp/humidity probe) aren't
+                # separately walked during discovery today, so there's no
+                # `data.aux_sensors` set to check membership against yet.
+                # Accept any pushed index.
+                new_aux_status = dict(data.aux_sensor_status)
+                new_aux_status[record.index] = record
+                self.async_set_updated_data(
+                    replace(data, aux_sensor_status=new_aux_status)
+                )
+        # Other pushed types are logged above but not yet merged — OmniData
+        # has no matching dict for them today.
+
     async def _run_event_listener(self) -> None:
         """Background loop: consume typed events and push state to entities.
 
@@ -710,6 +939,7 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
 
     def _apply_event(self, event: SystemEvent) -> None:
         """Patch ``self.data`` in place for the relevant event subclass."""
+        LOGGER.info("push event received: %r", event)
         data = self.data
         if data is None:
             return

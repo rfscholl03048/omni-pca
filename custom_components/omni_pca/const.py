@@ -20,6 +20,7 @@ CONF_TRANSPORT: Final = "transport"
 # PCA01.CFG, or 0 for a plain-text dump). Both must be set together.
 CONF_PCA_PATH: Final = "pca_path"
 CONF_PCA_KEY: Final = "pca_key"
+CONF_SCAN_INTERVAL: Final = "scan_interval"
 
 TRANSPORT_TCP: Final = "tcp"
 TRANSPORT_UDP: Final = "udp"
@@ -35,6 +36,7 @@ SCAN_INTERVAL: Final = timedelta(seconds=30)
 # Background event-listener task name, surfaced to ``asyncio.all_tasks()``
 # for diagnostics.
 EVENT_TASK_NAME: Final = "omni_pca-event-listener"
+STATUS_PUSH_TASK_NAME: Final = "omni_pca-status-push-listener"
 
 # Upper bound for the discovery walk. The protocol caps object indices at
 # uint16, but Omni panels never approach that — most installs have <100
