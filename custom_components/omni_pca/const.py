@@ -26,12 +26,16 @@ TRANSPORT_TCP: Final = "tcp"
 TRANSPORT_UDP: Final = "udp"
 DEFAULT_TRANSPORT: Final = TRANSPORT_TCP
 
-MANUFACTURER: Final = "HAI / Leviton"
-
-# Polling interval. Most state arrives via unsolicited push messages, so
-# this is just a safety net that keeps `last_update_success` honest if the
-# panel goes quiet.
+# Default poll interval. Kept short historically because push events were
+# never actually enabled by this library (see EnableNotifications fix in
+# omni_pca.client) — with push working, most installs can safely raise
+# this via the options flow and treat polling as a reconciliation
+# backstop rather than the primary source of state.
 SCAN_INTERVAL: Final = timedelta(seconds=30)
+MIN_SCAN_INTERVAL_SECONDS: Final = 5
+MAX_SCAN_INTERVAL_SECONDS: Final = 600
+
+MANUFACTURER: Final = "HAI / Leviton"
 
 # Background event-listener task name, surfaced to ``asyncio.all_tasks()``
 # for diagnostics.

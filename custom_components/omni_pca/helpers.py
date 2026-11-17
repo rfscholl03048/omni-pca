@@ -92,6 +92,12 @@ _ANALOG_ZONE_TYPES: frozenset[int] = frozenset({
     82,  # TEMPERATURE
     83,  # TEMP_ALARM
     84,  # HUMIDITY
+    85,  # EXTENDED_RANGE_OUTDOOR_TEMP (0x55) — see the matching entry in
+         # _ANALOG_ZONE_TYPE_TO_DEVICE_CLASS below for why this exists;
+         # this frozenset is what actually gates is_binary_zone_type(),
+         # so 85 has to be listed in BOTH places or a zone of this type
+         # gets classified as binary and skipped before the device-class
+         # lookup is ever consulted.
 })
 
 
@@ -349,6 +355,15 @@ _ANALOG_ZONE_TYPE_TO_DEVICE_CLASS: dict[int, str] = {
     82: SENSOR_DEVICE_CLASS_TEMPERATURE,  # TEMPERATURE
     83: SENSOR_DEVICE_CLASS_TEMPERATURE,  # TEMP_ALARM
     84: SENSOR_DEVICE_CLASS_HUMIDITY,     # HUMIDITY
+    85: SENSOR_DEVICE_CLASS_TEMPERATURE,  # EXTENDED_RANGE_OUTDOOR_TEMP (0x55) —
+                                          # a real, distinct zone type from 81's
+                                          # plain OUTDOOR_TEMP; confirmed against
+                                          # a live panel where PC Access shows
+                                          # this zone's Type as "ER Outdoor Temp".
+                                          # Was missing from this table entirely,
+                                          # so analog_zone_device_class() silently
+                                          # returned None and no sensor entity was
+                                          # ever created for it.
 }
 
 

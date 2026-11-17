@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
@@ -80,7 +81,7 @@ async def async_setup_entry(
 
 
 class OmniAnalogZoneSensor(
-    CoordinatorEntity[OmniDataUpdateCoordinator], SensorEntity
+    CoordinatorEntity[OmniDataUpdateCoordinator], RestoreSensor
 ):
     _attr_has_entity_name = True
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -102,17 +103,73 @@ class OmniAnalogZoneSensor(
             self._attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
         elif device_class_str == SENSOR_DEVICE_CLASS_HUMIDITY:
             self._attr_native_unit_of_measurement = PERCENTAGE
+        # Last real (non-sentinel) reading, held across both "no data this
+        # cycle" pushes and full HA restarts. Populated from restored state
+        # in async_added_to_hass, then kept current in native_value below.
+        self._last_value: float | int | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last real reading so a restart doesn't show -40/Unknown.
+
+        Runs once, before the coordinator has necessarily received any
+        push for this index yet. Without this, every HA restart re-opens
+        the same window that let ``zone_status.loop == 0`` render as a
+        nonsense -40 (see native_value below) — the entity would otherwise
+        sit on that until the panel's next real push happens to arrive.
+        """
+        await super().async_added_to_hass()
+        last_data = await self.async_get_last_sensor_data()
+        if last_data is not None and last_data.native_value is not None:
+            self._last_value = last_data.native_value
 
     @property
     def native_value(self) -> float | int | None:
+        # "Extended Range" analog zones (e.g. an outdoor temp/humidity
+        # probe wired as zone_type 85) report their live readings through
+        # the Aux Sensor status channel (ObjectType=8), not ZoneStatus,
+        # even though the object itself is defined/named as a Zone in
+        # PC Access. Confirmed against a live panel: PC Access shows this
+        # as a Zone, but every push/poll of its value arrives as an
+        # AuxSensorStatus(index=<same zone index>, ...) record. Check
+        # aux_sensor_status first; fall back to zone_status for analog
+        # zone types that genuinely do report via ZoneStatus.loop.
+        aux = self.coordinator.data.aux_sensor_status.get(self._index)
+        if aux is not None:
+            # raw=0 is the panel's documented "not available / unknown"
+            # sentinel (see omni_temp_to_fahrenheit's docstring) — it
+            # legitimately arrives interspersed between real readings.
+            # Converting it verbatim renders a nonsense -40°, flickering
+            # against otherwise-plausible values; hold the last real
+            # reading instead of dropping to Unknown for that cycle.
+            if aux.value_raw == 0:
+                return self._last_value
+            if self._attr_device_class == SensorDeviceClass.TEMPERATURE:
+                self._last_value = round(aux.temperature_f, 1)
+            else:
+                self._last_value = aux.value_raw
+            return self._last_value
         status = self.coordinator.data.zone_status.get(self._index)
         if status is None:
-            return None
+            return self._last_value
+        # Same sentinel applies here: a zone that has never had a real
+        # AuxSensorStatus push yet (e.g. right after a restart, before the
+        # panel's next update) still has a zone_status record from the
+        # initial poll with loop == 0 — that is *also* the "no data"
+        # sentinel, not a real reading of -40°F. Only humidity's 0% is a
+        # value the loop byte can legitimately report as zero, so gate the
+        # sentinel check to temperature.
+        if (
+            self._attr_device_class == SensorDeviceClass.TEMPERATURE
+            and status.loop == 0
+        ):
+            return self._last_value
         # Reuse the linear temp formula for temperature zones; humidity
         # zones report the loop byte as the percentage directly.
         if self._attr_device_class == SensorDeviceClass.TEMPERATURE:
-            return round(status.loop * 9 / 10) - 40
-        return status.loop
+            self._last_value = round(status.loop * 9 / 10) - 40
+        else:
+            self._last_value = status.loop
+        return self._last_value
 
 
 # --------------------------------------------------------------------------

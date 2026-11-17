@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_PORT
 
 from omni_pca.client import OmniClient
@@ -22,12 +22,16 @@ from .const import (
     CONF_CONTROLLER_KEY,
     CONF_PCA_KEY,
     CONF_PCA_PATH,
+    CONF_SCAN_INTERVAL,
     CONF_TRANSPORT,
     CONTROLLER_KEY_HEX_LEN,
     DEFAULT_PORT,
     DEFAULT_TRANSPORT,
     DOMAIN,
     LOGGER,
+    MAX_SCAN_INTERVAL_SECONDS,
+    MIN_SCAN_INTERVAL_SECONDS,
+    SCAN_INTERVAL,
     TRANSPORT_TCP,
     TRANSPORT_UDP,
 )
@@ -85,6 +89,40 @@ _USER_SCHEMA = vol.Schema(
 )
 
 
+class OmniOptionsFlow(OptionsFlow):
+    """Options flow: lets the user tune the poll (reconciliation) interval.
+
+    Push notifications (see the EnableNotifications fix in
+    ``omni_pca.client``) are now the primary way most state changes reach
+    Home Assistant promptly; this poll is a backstop that re-syncs
+    anything a dropped/missed push would leave stale. Slower installs or
+    panels with lots of zones/units may want a longer interval to reduce
+    load; installs that don't trust push yet may want it shorter.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        current = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL, int(SCAN_INTERVAL.total_seconds())
+        )
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_SCAN_INTERVAL, default=current): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(
+                        min=MIN_SCAN_INTERVAL_SECONDS,
+                        max=MAX_SCAN_INTERVAL_SECONDS,
+                    ),
+                ),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)
+
+
 class OmniConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for omni_pca."""
 
@@ -92,6 +130,12 @@ class OmniConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         self._reauth_entry_data: Mapping[str, Any] | None = None
+
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: ConfigFlowResult,
+    ) -> OmniOptionsFlow:
+        return OmniOptionsFlow()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
