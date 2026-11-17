@@ -96,6 +96,10 @@ from .const import (
 # panel that has never pushed.
 PUSH_WATCHDOG_SECS: Final = 900
 
+# Entity the Health dashboard's Logbook card is filtered on; entries written
+# via logbook.log attach to it. Best-effort: never raises.
+HEALTH_LOG_ENTITY: Final = "input_text.health_log"
+
 # --------------------------------------------------------------------------
 # Public data shape exposed to entities
 # --------------------------------------------------------------------------
@@ -181,6 +185,7 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
         self._event_task: asyncio.Task[None] | None = None
         self._status_push_task: asyncio.Task[None] | None = None
         self._push_seen = False
+        self._unreachable = False
         self._last_push = time.monotonic()
 
     # ---- public surface --------------------------------------------------
@@ -257,7 +262,14 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             raise ConfigEntryAuthFailed(str(err)) from err
         except (OmniConnectionError, RequestTimeoutError, OSError) as err:
             await self._drop_client()
+            if not self._unreachable:  # log the first failure, not every retry
+                self._unreachable = True
+                self._health_log(f"panel unreachable: {err}")
             raise UpdateFailed(f"panel unreachable: {err}") from err
+
+        if self._unreachable:
+            self._unreachable = False
+            self._health_log("panel reachable again")
 
         # Preserve any last_event already captured by the event task; the
         # poll path doesn't see push events so it must not overwrite it.
@@ -832,6 +844,25 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             STATUS_PUSH_TASK_NAME,
         )
 
+    def _health_log(self, message: str) -> None:
+        """Write one Logbook entry for the Health dashboard (best effort)."""
+
+        async def _write() -> None:
+            try:
+                await self.hass.services.async_call(
+                    "logbook",
+                    "log",
+                    {
+                        "name": "Omni panel",
+                        "message": message,
+                        "entity_id": HEALTH_LOG_ENTITY,
+                    },
+                )
+            except Exception:  # pragma: no cover - logging must never break polling
+                LOGGER.debug("health log write failed", exc_info=True)
+
+        self.hass.async_create_task(_write())
+
     async def _check_push_watchdog(self) -> None:
         """Reconnect if pushes were flowing but have gone silent."""
         if self._client is None or not self._push_seen:
@@ -842,6 +873,9 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
                 "no status push from panel for %.0f s while polling succeeds; "
                 "reconnecting to re-arm push notifications",
                 silent,
+            )
+            self._health_log(
+                f"no status push for {silent:.0f} s; reconnecting to re-arm push notifications"
             )
             self._last_push = time.monotonic()  # no reconnect storm
             await self._drop_client()
